@@ -1,0 +1,19 @@
+[project]
+name = "remote-gpu"
+version = "0.1.0"
+description = "Run Python on Kaggle GPUs from your local machine"
+requires-python = ">=3.9"
+dependencies = [
+    "click>=8.0",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+remote-gpu = "remote_gpu.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["remote_gpu*"]
