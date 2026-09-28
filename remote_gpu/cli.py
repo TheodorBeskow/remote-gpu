@@ -17,7 +17,8 @@ def main():
 @main.command()
 @click.argument("script", type=click.Path(exists=True))
 @click.option("--cpu", is_flag=True, help="Run on Kaggle CPU (doesn't use GPU quota)")
-def run(script, cpu):
+@click.option("--detach", is_flag=True, help="Push and return immediately — use `logs`/`pull` later")
+def run(script, cpu, detach):
     """Run a .py or .ipynb on Kaggle and pull the results back."""
     from .kaggle_manager import KaggleRunner
 
@@ -25,7 +26,30 @@ def run(script, cpu):
     if cpu:
         config.kaggle.gpu_enabled = False
 
-    KaggleRunner(config).run(Path(script))
+    runner = KaggleRunner(config)
+    if detach:
+        runner.launch(Path(script))
+    else:
+        runner.run(Path(script))
+
+
+@main.command()
+@click.option("--all", "show_all", is_flag=True, help="Full log instead of last 100 entries")
+@click.option("--follow", is_flag=True, help="Keep streaming until the run finishes")
+@click.option("--save", type=click.Path(), help="Also append output to this file")
+def logs(show_all, follow, save):
+    """Show the latest kernel's log."""
+    from .kaggle_manager import KaggleRunner
+
+    KaggleRunner(load_config()).stream_logs(show_all, follow, save)
+
+
+@main.command()
+def pull():
+    """Download output once the latest kernel is done."""
+    from .kaggle_manager import KaggleRunner
+
+    KaggleRunner(load_config()).pull()
 
 
 @main.command()

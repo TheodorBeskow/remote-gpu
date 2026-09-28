@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -61,10 +62,19 @@ class KaggleRunner:
         self.kernel_slug = f"{self.user}/{config.kaggle.notebook_name}"
 
     def run(self, entry: Path) -> None:
+        self.launch(entry)
+        if self._wait():
+            self._fetch_output(entry.parent)
+
+    def launch(self, entry: Path) -> None:
+        """Sync dataset + push kernel, then return (kernel runs async)."""
         self._sync_dataset(entry)
         self._push_kernel(entry)
-        self._wait()
-        self._fetch_output(entry)
+        state = self._load_state()
+        state["last_kernel"] = self.kernel_slug
+        state["entry_dir"] = str(entry.parent.resolve())
+        self._save_state(state)
+        click.echo(f"running: https://kaggle.com/code/{self.kernel_slug}")
 
     @property
     def _state_file(self) -> Path:
@@ -170,22 +180,89 @@ class KaggleRunner:
             if res.returncode != 0:
                 raise click.ClickException(f"kernel push failed: {res.stderr}")
 
-    def _wait(self) -> None:
-        click.echo("running on Kaggle (polling every "
-                   f"{POLL_INTERVAL}s, Ctrl+C to stop watching)...")
-        while True:
-            res = _kaggle("kernels", "status", self.kernel_slug)
-            out = (res.stdout + res.stderr).lower()
-            if "complete" in out:
-                click.echo("done")
-                return
-            if "error" in out or "cancel" in out:
-                raise click.ClickException(
-                    f"kernel failed — check https://kaggle.com/code/{self.kernel_slug}"
-                )
-            time.sleep(POLL_INTERVAL)
+    def _fetch_log_entries(self) -> list:
+        res = _kaggle("kernels", "logs", self.kernel_slug)
+        if res.returncode != 0:
+            return []
+        try:
+            return json.loads(res.stdout)
+        except json.JSONDecodeError:
+            return []
 
-    def _fetch_output(self, entry: Path) -> None:
+    def _wait(self) -> bool:
+        """Poll + stream logs until the kernel finishes. False if detached."""
+        click.echo(f"watching (Ctrl+C detaches — kernel keeps running)...")
+        seen = 0
+        try:
+            while True:
+                seen = self._print_new_logs(seen)
+                out = _kaggle("kernels", "status",
+                              self.kernel_slug).stdout.lower()
+                if "complete" in out:
+                    self._print_new_logs(seen)  # flush tail
+                    click.echo("done")
+                    return True
+                if "error" in out or "cancel" in out:
+                    self._print_new_logs(seen)
+                    raise click.ClickException(
+                        f"kernel failed — https://kaggle.com/code/{self.kernel_slug}"
+                    )
+                time.sleep(POLL_INTERVAL)
+        except KeyboardInterrupt:
+            click.echo(
+                f"\ndetached — kernel still running: "
+                f"https://kaggle.com/code/{self.kernel_slug}\n"
+                f"resume: `remote-gpu logs --follow` / download: `remote-gpu pull`"
+            )
+            return False
+
+    def _print_new_logs(self, seen: int) -> int:
+        entries = self._fetch_log_entries()
+        for e in entries[seen:]:
+            sys.stdout.write(e.get("data", ""))
+        sys.stdout.flush()
+        return len(entries)
+
+    def stream_logs(self, show_all: bool, follow: bool, save: str | None) -> None:
+        """`remote-gpu logs`: print/follow the latest kernel's log."""
+        fh = Path(save).open("a", encoding="utf-8") if save else None
+        seen = None
+        try:
+            while True:
+                entries = self._fetch_log_entries()
+                start = 0 if show_all else max(0, len(entries) - 100)
+                if seen is not None:
+                    start = seen
+                for e in entries[start:]:
+                    data = e.get("data", "")
+                    sys.stdout.write(data)
+                    if fh:
+                        fh.write(data)
+                sys.stdout.flush()
+                seen = len(entries)
+                if not follow:
+                    return
+                out = _kaggle("kernels", "status",
+                              self.kernel_slug).stdout.lower()
+                if "complete" in out or "error" in out or "cancel" in out:
+                    return
+                time.sleep(POLL_INTERVAL)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            if fh:
+                fh.close()
+
+    def pull(self) -> None:
+        """`remote-gpu pull`: download output once the kernel is done."""
+        out = _kaggle("kernels", "status", self.kernel_slug).stdout.lower()
+        if "complete" not in out:
+            click.echo(f"not done yet (status: {out.strip()})")
+            return
+        entry_dir = Path(self._load_state().get("entry_dir", "."))
+        self._fetch_output(entry_dir)
+
+    def _fetch_output(self, entry_dir: Path) -> None:
         click.echo("downloading output...")
         with tempfile.TemporaryDirectory() as tmp:
             res = _kaggle("kernels", "output", self.kernel_slug, "-p", tmp)
@@ -193,7 +270,7 @@ class KaggleRunner:
                 click.echo(f"warning: download failed: {res.stderr}")
                 return
 
-            out_dir = entry.parent / _relpath(self.config.paths.local_output)
+            out_dir = entry_dir / _relpath(self.config.paths.local_output)
             out_dir.mkdir(parents=True, exist_ok=True)
 
             # Unwrap the kaggle working dir: files written to ./output on
