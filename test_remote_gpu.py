@@ -1,5 +1,8 @@
+import importlib.util
 import io
 import json
+import os
+import re
 import tempfile
 import unittest
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
@@ -12,7 +15,7 @@ from click.testing import CliRunner
 from remote_gpu.cli import main
 from remote_gpu.config import Config, KaggleConfig, Paths, find_config, load_config
 from remote_gpu.kaggle_manager import KaggleRunner, _terminal_status
-from remote_gpu.kaggleify import build_preamble
+from remote_gpu.kaggleify import build_preamble, kaggleify_notebook
 
 
 class RemoteGpuTests(unittest.TestCase):
@@ -23,6 +26,7 @@ class RemoteGpuTests(unittest.TestCase):
         help_text = " ".join(run_help.output.split())
         self.assertIn("remote-gpu-settings.yaml", help_text)
         self.assertIn("or settings.yaml", help_text)
+        self.assertIn("both exist in the same directory", help_text)
         self.assertIn("script's directory", help_text)
         self.assertIn("parent directories", help_text)
         self.assertIn("local_input", help_text)
@@ -56,13 +60,22 @@ class RemoteGpuTests(unittest.TestCase):
 
             canonical = root / "remote-gpu-settings.yaml"
             canonical.write_text("name: canonical\n", encoding="utf-8")
-            self.assertEqual(find_config(nested), canonical)
-            self.assertEqual(load_config(nested).name, "canonical")
+            with self.assertRaisesRegex(click.UsageError, "both.*settings.yaml"):
+                find_config(nested)
+            entry = root / "solve.py"
+            entry.write_text("print('hello')", encoding="utf-8")
+            result = CliRunner().invoke(main, ["run", str(entry), "--dry-run"])
+            self.assertEqual(result.exit_code, 2)
+            self.assertIn("keep only one", result.output)
 
             nearer = nested / "settings.yaml"
             nearer.write_text("name: nearer\n", encoding="utf-8")
             self.assertEqual(find_config(nested), nearer)
             self.assertEqual(load_config(nested).name, "nearer")
+
+            alias.unlink()
+            self.assertEqual(find_config(root), canonical)
+            self.assertEqual(load_config(root).name, "canonical")
 
     def test_deprecated_quota_warning_is_not_treated_as_active(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
@@ -260,6 +273,23 @@ class RemoteGpuTests(unittest.TestCase):
             ):
                 self.assertFalse(runner._fetch_output(root))
 
+    def test_run_explains_missing_live_logs_once(self):
+        runner = KaggleRunner(Config(project_dir=Path.cwd(), name="run", kaggle=KaggleConfig(user="tester")))
+        statuses = iter(("status: running", "status: running", "status: complete"))
+
+        def kaggle(*args):
+            if args[1] == "logs":
+                return mock.Mock(returncode=0, stdout="[]")
+            return mock.Mock(returncode=0, stdout=next(statuses))
+
+        with mock.patch("remote_gpu.kaggle_manager._kaggle", side_effect=kaggle), mock.patch(
+            "remote_gpu.kaggle_manager.time.sleep"
+        ), mock.patch("remote_gpu.kaggle_manager.click.echo") as echo:
+            self.assertEqual(runner._wait(), "complete")
+        notices = [call.args[0] for call in echo.call_args_list if "No logs available" in call.args[0]]
+        self.assertEqual(len(notices), 1)
+        self.assertIn("Kaggle UI", notices[0])
+
     def test_logs_explain_empty_running_output_once(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
             root = Path(directory)
@@ -319,6 +349,50 @@ class RemoteGpuTests(unittest.TestCase):
             runner._sync_dataset(Path.cwd() / "missing" / "solve.py")
             self.assertTrue(all(str(call.args[0]).isascii() for call in echo.call_args_list))
 
+    def test_notebook_cell_ids_are_valid_unique_and_stable(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory)
+            src, dst, second = (root / name for name in ("source.ipynb", "upload.ipynb", "again.ipynb"))
+            cells = [
+                {"cell_type": "markdown", "metadata": {}, "source": ["no id"]},
+                {"cell_type": "code", "id": "remote-gpu-setup", "metadata": {}, "source": ["pass"], "execution_count": None, "outputs": []},
+                {"cell_type": "code", "id": "existing", "metadata": {}, "source": ["pass"], "execution_count": None, "outputs": []},
+                {"cell_type": "code", "id": "existing", "metadata": {}, "source": ["pass"], "execution_count": None, "outputs": []},
+            ]
+            original = {"cells": cells, "metadata": {}, "nbformat": 4, "nbformat_minor": 4}
+            src.write_text(json.dumps(original), encoding="utf-8")
+            config = Config(project_dir=root, name="run")
+            kaggleify_notebook(src, dst, config)
+            notebook = json.loads(dst.read_text(encoding="ascii"))
+            ids = [cell["id"] for cell in notebook["cells"]]
+            self.assertEqual(notebook["nbformat_minor"], 5)
+            self.assertEqual(ids[0], "remote-gpu-setup-1")
+            self.assertEqual(ids[2], "remote-gpu-setup")
+            self.assertEqual(ids[3], "existing")
+            self.assertEqual(len(ids), len(set(ids)))
+            self.assertTrue(all(re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", cell_id) for cell_id in ids))
+            self.assertEqual(json.loads(src.read_text(encoding="utf-8")), original)
+
+            kaggleify_notebook(src, second, config)
+            self.assertEqual(json.loads(second.read_text(encoding="ascii")), notebook)
+            kaggleify_notebook(dst, second, config)
+            self.assertEqual(json.loads(second.read_text(encoding="ascii")), notebook)
+
+    def test_example_notebook_has_ids_after_conversion(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory)
+            source = Path(__file__).parent / "example" / "solve.ipynb"
+            output = root / "solve.ipynb"
+            kaggleify_notebook(source, output, Config(project_dir=root, name="run"))
+            notebook = json.loads(output.read_text(encoding="ascii"))
+            cells = notebook["cells"]
+            self.assertTrue(all("id" in cell for cell in cells))
+            self.assertEqual(len({cell["id"] for cell in cells}), len(cells))
+            if importlib.util.find_spec("nbformat") is not None:
+                import nbformat
+
+                nbformat.validate(nbformat.from_dict(notebook))
+
     def test_custom_paths_and_managed_mount(self):
         config = Config(
             project_dir=Path.cwd(),
@@ -342,65 +416,138 @@ class RemoteGpuTests(unittest.TestCase):
             "'assets/input': 'tester/remote-gpu-data'",
             build_preamble(config, managed_input=True, managed_dataset="tester/remote-gpu-data"),
         )
+        managed = "/kaggle/input/custom/remote-gpu-data"
+        iris = "/kaggle/input/custom/datasets/uciml/iris"
         with mock.patch("os.path.exists", side_effect=lambda path: path in ("/kaggle", "/kaggle/input/custom")), mock.patch(
-            "glob.glob", side_effect=lambda pattern, **kwargs: [f"/kaggle/input/custom/{pattern.rsplit('/', 1)[-1]}"]
-        ) as glob, mock.patch("os.path.isdir", return_value=True), mock.patch("os.makedirs"), mock.patch(
-            "os.symlink"
-        ) as symlink, mock.patch("os.listdir", return_value=[]), mock.patch(
+            "os.path.isdir", side_effect=lambda path: path in (managed, iris)
+        ), mock.patch("os.scandir", side_effect=AssertionError("direct mounts need no scan")), mock.patch(
+            "os.makedirs"
+        ), mock.patch("os.symlink") as symlink, mock.patch("os.listdir", return_value=[]), mock.patch(
             "os.path.lexists", return_value=False
-        ), mock.patch.dict(
-            "sys.modules", {"torch": None}
-        ):
+        ), mock.patch.dict("sys.modules", {"torch": None}):
             exec(preamble, {})
-        self.assertTrue(all(call.args[0].startswith("/kaggle/input/custom/") for call in glob.call_args_list))
+        symlink.assert_any_call(managed, "assets/input")
+        symlink.assert_any_call(iris, "iris")
         symlink.assert_any_call("/kaggle/working/custom/results/output", "results/output")
 
+    def test_dataset_mount_avoids_scanning_dataset_contents(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory)
+            alice = root / "datasets" / "alice" / "shared"
+            bob = root / "datasets" / "bob" / "shared"
+            alice.mkdir(parents=True)
+            bob.mkdir(parents=True)
+            (alice / "panoramas").mkdir()
+            config = Config(
+                project_dir=root, name="run", paths=Paths(kaggle_input=root.as_posix()),
+                datasets={"alias_alice": "alice/shared", "alias_bob": "bob/shared"},
+            )
+            real_exists = os.path.exists
+            with mock.patch("os.path.exists", side_effect=lambda path: path == "/kaggle" or real_exists(path)), mock.patch(
+                "glob.glob", side_effect=AssertionError("recursive glob must not run")
+            ), mock.patch("os.scandir", side_effect=AssertionError("direct mounts need no directory scan")), mock.patch(
+                "os.makedirs"
+            ), mock.patch("os.symlink") as symlink, mock.patch("os.listdir", return_value=[]), mock.patch(
+                "os.path.lexists", return_value=False
+            ), mock.patch.dict("sys.modules", {"torch": None}):
+                exec(build_preamble(config), {})
+            symlink.assert_any_call(alice.as_posix(), "alias_alice")
+            symlink.assert_any_call(bob.as_posix(), "alias_bob")
+
+    def test_dataset_mount_fallback_is_bounded(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory)
+            for index in range(257):
+                (root / f"mount-{index}").mkdir()
+            config = Config(
+                project_dir=root, name="run", paths=Paths(kaggle_input=root.as_posix()),
+                datasets={"missing_alias": "owner/not-mounted"},
+            )
+            real_exists = os.path.exists
+            with mock.patch("os.path.exists", side_effect=lambda path: path == "/kaggle" or real_exists(path)), mock.patch(
+                "glob.glob", side_effect=AssertionError("recursive glob must not run")
+            ), mock.patch.dict("sys.modules", {"torch": None}):
+                with self.assertRaisesRegex(RuntimeError, "mount search limit reached"):
+                    exec(build_preamble(config), {})
+
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory)
+            flat = root / "datasets"
+            flat.mkdir()
+            for index in range(257):
+                (flat / f"panorama-{index}").mkdir()
+            config = Config(
+                project_dir=root, name="run", paths=Paths(kaggle_input=root.as_posix()),
+                datasets={"flat_alias": "owner/datasets"},
+            )
+            real_exists, real_scandir = os.path.exists, os.scandir
+
+            def shallow_scandir(path):
+                self.assertEqual(str(path).replace("\\", "/"), root.as_posix())
+                return real_scandir(path)
+
+            with mock.patch("os.path.exists", side_effect=lambda path: path == "/kaggle" or real_exists(path)), mock.patch(
+                "os.scandir", side_effect=shallow_scandir
+            ), mock.patch("glob.glob", side_effect=AssertionError("recursive glob must not run")), mock.patch(
+                "os.makedirs"
+            ), mock.patch("os.symlink") as symlink, mock.patch("os.listdir", return_value=[]), mock.patch(
+                "os.path.lexists", return_value=False
+            ), mock.patch.dict("sys.modules", {"torch": None}):
+                exec(build_preamble(config), {})
+            symlink.assert_any_call(flat.as_posix(), "flat_alias")
+
     def test_dataset_mount_prefers_full_owner_and_rejects_ambiguity(self):
-        input_root = "/kaggle/input"
-        hits = [f"{input_root}/datasets/{owner}/shared" for owner in ("alice", "bob")]
-        config = Config(
-            project_dir=Path.cwd(), name="run",
-            datasets={"alice_data": "alice/shared", "bob_data": "bob/shared"},
-        )
-        with mock.patch("os.path.exists", side_effect=lambda path: path in ("/kaggle", input_root)), mock.patch(
-            "glob.glob", return_value=hits
-        ), mock.patch("os.path.isdir", return_value=True), mock.patch("os.makedirs"), mock.patch(
-            "os.symlink"
-        ) as symlink, mock.patch("os.listdir", return_value=[]), mock.patch(
-            "os.path.lexists", return_value=False
-        ), mock.patch.dict("sys.modules", {"torch": None}):
-            exec(build_preamble(config), {})
-        symlink.assert_any_call(hits[0], "alice_data")
-        symlink.assert_any_call(hits[1], "bob_data")
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory)
+            alice = root / "datasets" / "alice" / "shared"
+            bob = root / "datasets" / "bob" / "shared"
+            alice.mkdir(parents=True)
+            bob.mkdir(parents=True)
+            config = Config(
+                project_dir=root, name="run", paths=Paths(kaggle_input=root.as_posix()),
+                datasets={"alice_data": "alice/shared", "bob_data": "bob/shared"},
+            )
+            real_exists, real_scandir = os.path.exists, os.scandir
+            scanned = []
 
-        config.datasets = {"missing": "charlie/shared"}
-        with mock.patch("os.path.exists", side_effect=lambda path: path in ("/kaggle", input_root)), mock.patch(
-            "glob.glob", return_value=hits
-        ), mock.patch("os.path.isdir", return_value=True), mock.patch.dict(
-            "sys.modules", {"torch": None}
-        ):
+            def shallow_scandir(path):
+                scanned.append(str(path).replace("\\", "/"))
+                self.assertIn(scanned[-1], {root.as_posix(), (root / "datasets").as_posix(), (root / "flat").as_posix()})
+                return real_scandir(path)
+
+            def resolve():
+                with mock.patch("os.path.exists", side_effect=lambda path: path == "/kaggle" or real_exists(path)), mock.patch(
+                    "glob.glob", side_effect=AssertionError("recursive glob must not run")
+                ), mock.patch("os.scandir", side_effect=shallow_scandir), mock.patch("os.makedirs"), mock.patch(
+                    "os.symlink"
+                ) as symlink, mock.patch("os.listdir", return_value=[]), mock.patch(
+                    "os.path.lexists", return_value=False
+                ), mock.patch.dict("sys.modules", {"torch": None}):
+                    exec(build_preamble(config), {})
+                return symlink
+
+            symlink = resolve()
+            symlink.assert_any_call(alice.as_posix(), "alice_data")
+            symlink.assert_any_call(bob.as_posix(), "bob_data")
+            self.assertEqual(scanned, [])
+
+            config.datasets = {"missing": "charlie/shared"}
             with self.assertRaisesRegex(RuntimeError, "ambiguous.*charlie/shared"):
-                exec(build_preamble(config), {})
+                resolve()
+            self.assertEqual(set(scanned), {root.as_posix(), (root / "datasets").as_posix()})
 
-        config.datasets = {"flat": "alice/shared"}
-        with mock.patch("os.path.exists", side_effect=lambda path: path in ("/kaggle", input_root)), mock.patch(
-            "glob.glob", return_value=[f"{input_root}/shared"]
-        ), mock.patch("os.path.isdir", return_value=True), mock.patch("os.makedirs"), mock.patch(
-            "os.symlink"
-        ) as symlink, mock.patch("os.listdir", return_value=[]), mock.patch(
-            "os.path.lexists", return_value=False
-        ), mock.patch.dict("sys.modules", {"torch": None}):
-            exec(build_preamble(config), {})
-        symlink.assert_any_call(f"{input_root}/shared", "flat")
+            flat_root = root / "flat"
+            (flat_root / "shared").mkdir(parents=True)
+            config.paths.kaggle_input = flat_root.as_posix()
+            config.datasets = {"flat_alias": "alice/shared"}
+            scanned.clear()
+            symlink = resolve()
+            symlink.assert_any_call((flat_root / "shared").as_posix(), "flat_alias")
+            self.assertEqual(set(scanned), {flat_root.as_posix()})
 
-        config.datasets = {"alice_data": "alice/shared", "bob_data": "bob/shared"}
-        with mock.patch("os.path.exists", side_effect=lambda path: path in ("/kaggle", input_root)), mock.patch(
-            "glob.glob", return_value=[f"{input_root}/shared"]
-        ), mock.patch("os.path.isdir", return_value=True), mock.patch.dict(
-            "sys.modules", {"torch": None}
-        ):
+            config.datasets = {"alice_data": "alice/shared", "bob_data": "bob/shared"}
             with self.assertRaisesRegex(RuntimeError, "ambiguous.*shared"):
-                exec(build_preamble(config), {})
+                resolve()
 
     def test_fetch_custom_output_root(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:

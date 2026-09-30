@@ -36,7 +36,7 @@ my-project/
 
 ## Configuration
 
-Name the file `remote-gpu-settings.yaml` or `settings.yaml`. The search starts in the script's directory and moves upward. The nearest directory wins; if both names exist there, `remote-gpu-settings.yaml` takes priority. `local_input` and `local_output` are relative to the script's directory.
+Name the file `remote-gpu-settings.yaml` or `settings.yaml`. The search starts in the script's directory and moves upward. The nearest directory wins; if both names exist there, remote-gpu reports an error and asks you to keep only one. `local_input` and `local_output` are relative to the script's directory.
 
 ```yaml
 name: my-project          # optional, defaults to folder name
@@ -53,7 +53,7 @@ datasets:                      # attach existing Kaggle datasets (optional)
   iris: uciml/iris             # ./iris/ resolves to the mounted dataset
 ```
 
-Set `kaggle.internet_enabled: true` for runs that download model weights (such as StreetCLIP), or attach pre-downloaded weights via `datasets`. Dataset mounts use the full `owner/slug` when Kaggle exposes it; a flat mount is used only when unambiguous. `kaggle_input` is the dataset mount root; `kaggle_output` is the remote output root and must be inside `/kaggle/working` for results to be downloaded. If there is no local input directory, no managed input dataset is attached or mounted. `runtime.quota_warning_hours` is deprecated and has no effect; GPU quota warnings are not implemented.
+Set `kaggle.internet_enabled: true` for runs that download model weights (such as StreetCLIP), or attach pre-downloaded weights via `datasets`. Dataset mounts check the exact `<kaggle_input>/datasets/<owner>/<slug>` and `<kaggle_input>/<slug>` locations first, then perform a bounded, directory-only fallback instead of recursively traversing dataset contents. A flat mount is used only when unambiguous. `kaggle_input` is the dataset mount root; `kaggle_output` is the remote output root and must be inside `/kaggle/working` for results to be downloaded. If there is no local input directory, no managed input dataset is attached or mounted. `runtime.quota_warning_hours` is deprecated and has no effect; GPU quota warnings are not implemented.
 
 ## Commands
 
@@ -72,7 +72,7 @@ remote-gpu pull                   # download available output after a run stops
 
 A failed, cancelled, or timed-out kernel can still have downloadable output. `remote-gpu run` attempts to recover it before reporting the failure; `remote-gpu pull` also attempts a download after those statuses. Recovery depends on what Kaggle makes available, and an unavailable or empty output is reported as an error.
 
-Kaggle may not expose live cell output for a running notebook through its logs API. When `remote-gpu logs` gets no entries, it explains this rather than showing a blank screen. A RUNNING status does not prove progress; check the Kaggle UI and write periodic checkpoint or progress files to `/kaggle/working` so they can be downloaded after the run stops if Kaggle makes them available. `--follow` cannot force live cell output to appear.
+Kaggle may not expose live cell output for a running notebook through its logs API. When `remote-gpu run` or `remote-gpu logs` gets no entries while the kernel is running, it explains this once rather than silently waiting. A RUNNING status does not prove progress; check the Kaggle UI and write periodic checkpoint or progress files to `/kaggle/working` so they can be downloaded after the run stops if Kaggle makes them available. `--follow` cannot force live cell output to appear.
 
 ## How it works
 
@@ -80,5 +80,6 @@ Kaggle may not expose live cell output for a running notebook through its logs A
   (skipped when unchanged)
 - Your notebook gets an injected preamble that symlinks `input` → the mounted
   dataset and creates `output`, then is pushed to kernel `you/remote-gpu-<name>`
+- The uploaded copy gets stable, unique cell IDs (nbformat 4.5); the local notebook is unchanged
 - After the run stops, files Kaggle makes available from `/kaggle/working` are
   downloaded into `output/`

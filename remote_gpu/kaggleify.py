@@ -7,12 +7,14 @@ Every spelling of a relative path then resolves correctly.
 
 import json
 import os
+import re
 import sys
 from pathlib import Path, PurePosixPath
 
 from .config import Config, load_config
 
 PREAMBLE_MARKER = "# [remote-gpu] injected path setup"
+CELL_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 def _relpath(p: str) -> str:
@@ -29,7 +31,7 @@ def build_preamble(
     kaggle_input = config.paths.kaggle_input.rstrip("/")
     kaggle_output = str(PurePosixPath(config.paths.kaggle_output) / local_output)
     # managed dataset (synced input/) + any user-attached datasets —
-    # values are dataset slugs we glob for under /kaggle/input/**/
+    # values are full dataset slugs used to resolve Kaggle mounts.
     if managed_dataset is None:
         managed_dataset = (
             f"{config.kaggle.user}/{config.kaggle.dataset_name}"
@@ -39,23 +41,64 @@ def build_preamble(
     mounts.update(config.datasets)
     lines = [
         PREAMBLE_MARKER,
-        "import os, glob, posixpath",
+        "import os, posixpath",
         'if os.path.exists("/kaggle"):',
         # Kaggle mounts datasets under /kaggle/input/datasets/<owner>/<slug>/
         # when attached via API, or /kaggle/input/<slug>/ via the web editor —
-        # resolve by globbing instead of hardcoding a convention.
+        # check exact paths first, then search only shallow mount directories.
         f"    _mounts = {mounts!r}",
         f"    _input = {kaggle_input!r}",
+        "    _search_cache = {}",
+        "    def _shallow_hits(_slug):",
+        "        _found = set()",
+        "        if os.path.isdir(_input):",
+        "            with os.scandir(_input) as _entries:",
+        "                for _index, _entry in enumerate(_entries):",
+        "                    if _index >= 256:",
+        '                        raise RuntimeError("[remote-gpu] mount search limit reached under " + _input)',
+        "                    if not _entry.is_dir():",
+        "                        continue",
+        '                    if _entry.name == "datasets" and _slug != "datasets":',
+        "                        with os.scandir(_entry.path) as _owners:",
+        "                            for _owner_index, _owner_dir in enumerate(_owners):",
+        "                                if _owner_index >= 256:",
+        '                                    raise RuntimeError("[remote-gpu] mount search limit reached under " + _entry.path)',
+        "                                if _owner_dir.is_dir():",
+        "                                    _candidate = posixpath.join(_owner_dir.path, _slug)",
+        "                                    if os.path.isdir(_candidate):",
+        "                                        _found.add(_candidate)",
+        "                    else:",
+        "                        _candidate = posixpath.join(_entry.path, _slug)",
+        "                        if os.path.isdir(_candidate):",
+        "                            _found.add(_candidate)",
+        "        return sorted(_found)",
         "    for _rel, _source in _mounts.items():",
         "        if not os.path.exists(_rel):",
         '            _slug = _source.rsplit("/", 1)[-1]',
-        '            _hits = sorted(set(p for p in glob.glob(posixpath.join(_input, "**", glob.escape(_slug)), recursive=True) if os.path.isdir(p)))',
         '            _owner = _source.split("/", 1)[0] if "/" in _source else None',
-        '            _owned = [p for p in _hits if posixpath.basename(posixpath.dirname(p)) == _owner] if _owner else []',
-        '            _flat_sources = {source for source in _mounts.values() if source.rsplit("/", 1)[-1] == _slug}',
-        "            if len(_owned) > 1 or (not _owned and _hits and (len(_hits) > 1 or len(_flat_sources) > 1)):",
-        '                raise RuntimeError(f"[remote-gpu] ambiguous dataset {_source}: {_hits}")',
-        '            _hit = _owned[0] if _owned else (_hits[0] if _hits and (not _owner or _hits[0] == posixpath.join(_input, _slug)) else None)',
+        "            _owned = []",
+        "            if _owner:",
+        "                for _candidate in (posixpath.join(_input, 'datasets', _owner, _slug),",
+        "                                   posixpath.join(_input, _owner, _slug)):",
+        "                    if os.path.isdir(_candidate):",
+        "                        _owned.append(_candidate)",
+        "            if len(_owned) > 1:",
+        '                raise RuntimeError(f"[remote-gpu] ambiguous dataset {_source}: {_owned}")',
+        "            if _owned:",
+        "                _hit = _owned[0]",
+        "            else:",
+        "                _flat = posixpath.join(_input, _slug)",
+        "                _flat_exists = os.path.isdir(_flat)",
+        "                if _slug not in _search_cache:",
+        "                    _search_cache[_slug] = _shallow_hits(_slug)",
+        "                _hits = set(_search_cache[_slug])",
+        "                if _flat_exists:",
+        "                    _hits.add(_flat)",
+        '                _owned = [p for p in _hits if _owner and posixpath.basename(posixpath.dirname(p)) == _owner]',
+        '                _flat_sources = {source for source in _mounts.values() if source.rsplit("/", 1)[-1] == _slug}',
+        "                if len(_owned) > 1 or (not _owned and _hits and (len(_hits) > 1 or len(_flat_sources) > 1)):",
+        '                    raise RuntimeError(f"[remote-gpu] ambiguous dataset {_source}: {sorted(_hits)}")',
+        "                _hit = _owned[0] if _owned else (_flat if _hits == {_flat} else None)",
         "            if _hit:",
         '                _parent = os.path.dirname(_rel)',
         "                if _parent:",
@@ -81,10 +124,21 @@ def build_preamble(
     return "\n".join(lines)
 
 
-def make_cell(source: str) -> dict:
+def _unique_cell_id(base: str, used: set[str]) -> str:
+    cell_id = base
+    suffix = 1
+    while cell_id in used:
+        cell_id = f"{base}-{suffix}"
+        suffix += 1
+    used.add(cell_id)
+    return cell_id
+
+
+def make_cell(source: str, cell_id: str) -> dict:
     """Wrap source code in a notebook cell."""
     return {
         "cell_type": "code",
+        "id": cell_id,
         "execution_count": None,
         "metadata": {},
         "outputs": [],
@@ -102,14 +156,33 @@ def kaggleify_notebook(
         managed_input = (src.parent / _relpath(config.paths.local_input)).is_dir()
 
     # Don't double-inject
+    cells = nb.setdefault("cells", [])
+    reserved = {
+        cell["id"] for cell in cells
+        if isinstance(cell.get("id"), str) and CELL_ID_PATTERN.fullmatch(cell["id"])
+    }
     already = any(
         PREAMBLE_MARKER in "".join(cell.get("source", []))
-        for cell in nb.get("cells", [])
+        for cell in cells
     )
     if not already:
-        nb.setdefault("cells", []).insert(
-            0, make_cell(build_preamble(config, managed_input, managed_dataset))
+        cells.insert(
+            0, make_cell(
+                build_preamble(config, managed_input, managed_dataset),
+                _unique_cell_id("remote-gpu-setup", reserved),
+            )
         )
+    seen = set()
+    for index, cell in enumerate(cells):
+        cell_id = cell.get("id")
+        if not isinstance(cell_id, str) or not CELL_ID_PATTERN.fullmatch(cell_id) or cell_id in seen:
+            base = (
+                "remote-gpu-setup" if PREAMBLE_MARKER in "".join(cell.get("source", []))
+                else f"remote-gpu-cell-{index}"
+            )
+            cell_id = cell["id"] = _unique_cell_id(base, reserved)
+        seen.add(cell_id)
+    nb["nbformat_minor"] = max(5, nb.get("nbformat_minor", 0))
 
     # ensure_ascii=True escapes non-ASCII chars — the file becomes pure ASCII,
     # immune to wrong-codepage reads during upload (Windows cp1252 mangling).

@@ -24,9 +24,9 @@ def run(script, cpu, internet, dry_run, detach):
     """Run a .py or .ipynb on Kaggle and pull the results back.
 
     Looks for remote-gpu-settings.yaml or settings.yaml in the script's
-    directory and parent directories. The nearer directory wins; in the
-    same directory, remote-gpu-settings.yaml takes priority. local_input
-    and local_output paths are relative to the script's directory.
+    directory and parent directories. The nearer directory wins. If
+    both exist in the same directory, remove one. local_input and
+    local_output paths are relative to the script's directory.
     """
     from .kaggle_manager import KaggleRunner
 

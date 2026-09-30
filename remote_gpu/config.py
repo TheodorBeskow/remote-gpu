@@ -52,10 +52,13 @@ def find_config(start: Path | None = None) -> Path:
     """Search upward from `start` (default: cwd) for a config file."""
     start = start or Path.cwd()
     for directory in (start, *start.parents):
-        for filename in CONFIG_FILENAMES:
-            candidate = directory / filename
-            if candidate.is_file():
-                return candidate
+        matches = [directory / filename for filename in CONFIG_FILENAMES if (directory / filename).is_file()]
+        if len(matches) > 1:
+            raise click.UsageError(
+                f"both {' and '.join(CONFIG_FILENAMES)} found in {directory}; keep only one"
+            )
+        if matches:
+            return matches[0]
     raise FileNotFoundError(
         f"Could not find {' or '.join(CONFIG_FILENAMES)} in {start} or any parent directory"
     )

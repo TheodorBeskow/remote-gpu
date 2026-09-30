@@ -21,6 +21,11 @@ from .config import Config
 from .kaggleify import kaggleify_notebook, kaggleify_script
 
 POLL_INTERVAL = 15  # seconds between status checks
+NO_LIVE_LOGS_NOTICE = (
+    "No logs available yet. Kaggle may not expose live cell output while running; "
+    "RUNNING does not confirm progress. Check the Kaggle UI or write progress "
+    "to checkpoint files for retrieval after the run stops"
+)
 
 
 def _username(config: Config) -> str:
@@ -249,6 +254,7 @@ class KaggleRunner:
         """Poll + stream logs until the kernel finishes, or detach."""
         click.echo("watching (Ctrl+C detaches - kernel keeps running)...")
         seen = 0
+        notice_shown = False
         try:
             while True:
                 seen = self._print_new_logs(seen)
@@ -261,6 +267,9 @@ class KaggleRunner:
                     if status == "complete":
                         click.echo("done")
                     return status
+                if seen == 0 and not notice_shown and "running" in res.stdout.lower():
+                    click.echo(NO_LIVE_LOGS_NOTICE, err=True)
+                    notice_shown = True
                 time.sleep(POLL_INTERVAL)
         except KeyboardInterrupt:
             click.echo(
@@ -293,11 +302,7 @@ class KaggleRunner:
                     elif _terminal_status(status_res.stdout.lower()):
                         message = "No logs available from Kaggle for this run"
                     else:
-                        message = (
-                            "No logs available yet. Kaggle may not expose live cell output while running; "
-                            "RUNNING does not confirm progress. Check the Kaggle UI or write progress "
-                            "to checkpoint files for retrieval after the run stops"
-                        )
+                        message = NO_LIVE_LOGS_NOTICE
                     click.echo(message, err=True)
                     notice_shown = True
                 start = 0 if show_all else max(0, len(entries) - 100)
