@@ -17,9 +17,14 @@ def main():
 @main.command()
 @click.argument("script", type=click.Path(exists=True))
 @click.option("--cpu", is_flag=True, help="Run on Kaggle CPU (doesn't use GPU quota)")
-@click.option("--detach", is_flag=True, help="Push and return immediately — use `logs`/`pull` later")
+@click.option("--detach", is_flag=True, help="Push and return immediately - use `logs`/`pull` later")
 def run(script, cpu, detach):
-    """Run a .py or .ipynb on Kaggle and pull the results back."""
+    """Run a .py or .ipynb on Kaggle and pull the results back.
+
+    Looks for remote-gpu-settings.yaml in the script's directory and
+    parent directories. local_input and local_output paths are relative
+    to the script's directory.
+    """
     from .kaggle_manager import KaggleRunner
 
     config = load_config(Path(script).parent)
@@ -54,7 +59,7 @@ def pull():
 
 @main.command()
 def status():
-    """Show Kaggle auth + quota info."""
+    """Show Kaggle authentication status (quota tracking is not available yet)."""
     for name in ("kaggle.json", "credentials.json"):
         creds = Path.home() / ".kaggle" / name
         if creds.is_file():

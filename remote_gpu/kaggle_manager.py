@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import click
 
@@ -98,7 +98,7 @@ class KaggleRunner:
         """Upload input/ as (or version onto) our single dataset."""
         input_dir = entry.parent / _relpath(self.config.paths.local_input)
         if not input_dir.is_dir():
-            self._managed_exists = self._dataset_exists()
+            self._managed_exists = False
             click.echo("no input dir — skipping dataset upload")
             return
 
@@ -154,6 +154,12 @@ class KaggleRunner:
 
     def _push_kernel(self, entry: Path) -> None:
         """Write the kaggleified notebook + metadata, then push."""
+        if not PurePosixPath(self.config.paths.kaggle_output).is_relative_to(
+            "/kaggle/working"
+        ):
+            raise click.UsageError(
+                "paths.kaggle_output must be within /kaggle/working to download results"
+            )
         click.echo("pushing kernel...")
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
@@ -161,9 +167,9 @@ class KaggleRunner:
             code_name = f"solve{entry.suffix}"
 
             if is_nb:
-                kaggleify_notebook(entry, tmp / code_name, self.config)
+                kaggleify_notebook(entry, tmp / code_name, self.config, self._managed_exists)
             else:
-                kaggleify_script(entry, tmp / code_name, self.config)
+                kaggleify_script(entry, tmp / code_name, self.config, self._managed_exists)
 
             meta = {
                 "id": self.kernel_slug,
@@ -173,7 +179,7 @@ class KaggleRunner:
                 "kernel_type": "notebook" if is_nb else "script",
                 "is_private": True,
                 "enable_gpu": self.config.kaggle.gpu_enabled,
-                "enable_internet": False,
+                "enable_internet": self.config.kaggle.internet_enabled,
                 "dataset_sources": [
                     *self.config.datasets.values(),
                     *([self.dataset_slug] if self._managed_exists else []),
@@ -283,11 +289,21 @@ class KaggleRunner:
             # Unwrap the kaggle working dir: files written to ./output on
             # Kaggle land in tmp/<output>/ — merge its contents back, and
             # drop stray top-level files (logs, executed nb) alongside them.
-            inner = Path(tmp) / _relpath(self.config.paths.local_output)
+            try:
+                output_root = PurePosixPath(self.config.paths.kaggle_output).relative_to(
+                    "/kaggle/working"
+                )
+            except ValueError as exc:
+                raise click.UsageError(
+                    "paths.kaggle_output must be within /kaggle/working to download results"
+                ) from exc
+            inner = Path(tmp) / str(output_root) / _relpath(self.config.paths.local_output)
+            if inner.is_dir():
+                shutil.copytree(inner, out_dir, dirs_exist_ok=True)
             for item in Path(tmp).iterdir():
-                if item == inner:
-                    shutil.copytree(item, out_dir, dirs_exist_ok=True)
-                elif item.is_dir():
+                if item == inner or item in inner.parents:
+                    continue
+                if item.is_dir():
                     shutil.copytree(item, out_dir / item.name, dirs_exist_ok=True)
                 else:
                     shutil.copy2(item, out_dir / item.name)

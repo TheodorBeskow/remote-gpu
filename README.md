@@ -41,12 +41,17 @@ name: my-project          # optional, defaults to folder name
 paths:                    # all optional, these are the defaults
   local_input: "./input"
   local_output: "./output"
+  kaggle_input: "/kaggle/input"
+  kaggle_output: "/kaggle/working"
 kaggle:
   gpu_enabled: true
+  internet_enabled: false
 
 datasets:                      # attach existing Kaggle datasets (optional)
   iris: uciml/iris             # ./iris/ resolves to the mounted dataset
 ```
+
+Set `kaggle.internet_enabled: true` for runs that download model weights (such as StreetCLIP), or attach pre-downloaded weights via `datasets`. `kaggle_input` is the dataset mount root; `kaggle_output` is the remote output root and must be inside `/kaggle/working` for results to be downloaded. If there is no local input directory, no managed input dataset is attached or mounted.
 
 ## Commands
 

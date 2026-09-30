@@ -1,5 +1,10 @@
 name: mnist-remote-gpu
 
+paths:
+  local_input: "./input"
+  local_output: "./output"
+  kaggle_input: "/kaggle/input"
+  kaggle_output: "/kaggle/working"
 
 kaggle:
   gpu_enabled: true

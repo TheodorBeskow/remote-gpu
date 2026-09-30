@@ -28,6 +28,7 @@ class KaggleConfig:
     notebook_name: str = "remote-gpu-runner"
     dataset_name: str = "remote-gpu-data"
     gpu_enabled: bool = True
+    internet_enabled: bool = False
 
 
 @dataclass
@@ -82,6 +83,7 @@ def load_config(start: Path | None = None) -> Config:
             notebook_name=kaggle_raw.get("notebook_name", f"remote-gpu-{name}"),
             dataset_name=kaggle_raw.get("dataset_name", f"remote-gpu-{name}-data"),
             gpu_enabled=kaggle_raw.get("gpu_enabled", True),
+            internet_enabled=kaggle_raw.get("internet_enabled", False),
         ),
         runtime=RuntimeConfig(
             auto_gpu_detect=runtime_raw.get("auto_gpu_detect", True),

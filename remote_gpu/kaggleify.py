@@ -20,12 +20,15 @@ def _relpath(p: str) -> str:
     return PurePosixPath(p.replace("\\", "/")).as_posix().removeprefix("./")
 
 
-def build_preamble(config: Config) -> str:
+def build_preamble(config: Config, managed_input: bool = False) -> str:
     """Generate the injected cell. No-ops everywhere except on Kaggle."""
     local_input = _relpath(config.paths.local_input)
+    local_output = _relpath(config.paths.local_output)
+    kaggle_input = config.paths.kaggle_input.rstrip("/")
+    kaggle_output = str(PurePosixPath(config.paths.kaggle_output) / local_output)
     # managed dataset (synced input/) + any user-attached datasets —
     # values are dataset slugs we glob for under /kaggle/input/**/
-    mounts = {local_input: config.kaggle.dataset_name}
+    mounts = {local_input: config.kaggle.dataset_name} if managed_input else {}
     mounts.update({name: slug.split("/")[-1] for name, slug in config.datasets.items()})
     lines = [
         PREAMBLE_MARKER,
@@ -35,9 +38,10 @@ def build_preamble(config: Config) -> str:
         # when attached via API, or /kaggle/input/<slug>/ via the web editor —
         # resolve by globbing instead of hardcoding a convention.
         f"    _mounts = {mounts!r}",
+        f"    _input = {kaggle_input!r}",
         "    for _rel, _slug in _mounts.items():",
         "        if not os.path.exists(_rel):",
-        '            _hits = glob.glob(f"/kaggle/input/**/{_slug}", recursive=True)',
+        '            _hits = glob.glob(f"{_input}/**/{_slug}", recursive=True)',
         "            if _hits:",
         '                _parent = os.path.dirname(_rel)',
         "                if _parent:",
@@ -46,8 +50,14 @@ def build_preamble(config: Config) -> str:
         '                print(f"[remote-gpu] {_rel} -> {_hits[0]}")',
         "            else:",
         '                print(f"[remote-gpu] WARNING: dataset {_slug} not mounted")',
-        '    print("[remote-gpu] /kaggle/input:", os.listdir("/kaggle/input") if os.path.exists("/kaggle/input") else "MISSING")',
-        f'    os.makedirs("{_relpath(config.paths.local_output)}", exist_ok=True)',
+        '    print("[remote-gpu]", _input + ":", os.listdir(_input) if os.path.exists(_input) else "MISSING")',
+        f"    _output = {kaggle_output!r}",
+        f"    _local_output = {local_output!r}",
+        "    os.makedirs(_output, exist_ok=True)",
+        "    if os.path.abspath(_local_output) != os.path.abspath(_output):",
+        "        os.makedirs(os.path.dirname(_local_output) or '.', exist_ok=True)",
+        "        if not os.path.lexists(_local_output):",
+        "            os.symlink(_output, _local_output)",
         "    try:",
         "        import torch",
         '        print("[remote-gpu] GPU:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none")',
@@ -68,9 +78,13 @@ def make_cell(source: str) -> dict:
     }
 
 
-def kaggleify_notebook(src: Path, dst: Path, config: Config) -> Path:
+def kaggleify_notebook(
+    src: Path, dst: Path, config: Config, managed_input: bool | None = None
+) -> Path:
     """Copy `src` notebook to `dst` with the preamble cell injected."""
     nb = json.loads(src.read_text(encoding="utf-8"))
+    if managed_input is None:
+        managed_input = (src.parent / _relpath(config.paths.local_input)).is_dir()
 
     # Don't double-inject
     already = any(
@@ -78,7 +92,7 @@ def kaggleify_notebook(src: Path, dst: Path, config: Config) -> Path:
         for cell in nb.get("cells", [])
     )
     if not already:
-        nb.setdefault("cells", []).insert(0, make_cell(build_preamble(config)))
+        nb.setdefault("cells", []).insert(0, make_cell(build_preamble(config, managed_input)))
 
     # ensure_ascii=True escapes non-ASCII chars — the file becomes pure ASCII,
     # immune to wrong-codepage reads during upload (Windows cp1252 mangling).
@@ -86,11 +100,15 @@ def kaggleify_notebook(src: Path, dst: Path, config: Config) -> Path:
     return dst
 
 
-def kaggleify_script(src: Path, dst: Path, config: Config) -> Path:
+def kaggleify_script(
+    src: Path, dst: Path, config: Config, managed_input: bool | None = None
+) -> Path:
     """Copy `src` python file to `dst` with the preamble prepended."""
     code = src.read_text(encoding="utf-8")
+    if managed_input is None:
+        managed_input = (src.parent / _relpath(config.paths.local_input)).is_dir()
     if PREAMBLE_MARKER not in code:
-        code = build_preamble(config) + "\n\n" + code
+        code = build_preamble(config, managed_input) + "\n\n" + code
     dst.write_text(code, encoding="utf-8")
     return dst
 
