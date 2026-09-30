@@ -3,9 +3,11 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import click
 import yaml
 
 CONFIG_FILENAME = "remote-gpu-settings.yaml"
+CONFIG_FILENAMES = (CONFIG_FILENAME, "settings.yaml")
 
 # Defaults used when the yaml omits a path
 DEFAULT_LOCAL_INPUT = "./input"
@@ -34,7 +36,6 @@ class KaggleConfig:
 @dataclass
 class RuntimeConfig:
     auto_gpu_detect: bool = True
-    quota_warning_hours: int = 5
 
 
 @dataclass
@@ -48,19 +49,20 @@ class Config:
 
 
 def find_config(start: Path | None = None) -> Path:
-    """Search upward from `start` (default: cwd) for the config file."""
+    """Search upward from `start` (default: cwd) for a config file."""
     start = start or Path.cwd()
     for directory in (start, *start.parents):
-        candidate = directory / CONFIG_FILENAME
-        if candidate.is_file():
-            return candidate
+        for filename in CONFIG_FILENAMES:
+            candidate = directory / filename
+            if candidate.is_file():
+                return candidate
     raise FileNotFoundError(
-        f"Could not find {CONFIG_FILENAME} in {start} or any parent directory"
+        f"Could not find {' or '.join(CONFIG_FILENAMES)} in {start} or any parent directory"
     )
 
 
 def load_config(start: Path | None = None) -> Config:
-    """Load remote-gpu-settings.yaml, applying defaults for missing keys."""
+    """Load a config file, applying defaults for missing keys."""
     config_path = find_config(start)
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
 
@@ -68,6 +70,11 @@ def load_config(start: Path | None = None) -> Config:
     paths_raw = raw.get("paths") or {}
     kaggle_raw = raw.get("kaggle") or {}
     runtime_raw = raw.get("runtime") or {}
+    if "quota_warning_hours" in runtime_raw:
+        click.echo(
+            "warning: runtime.quota_warning_hours has no effect; quota warnings are not implemented",
+            err=True,
+        )
 
     return Config(
         project_dir=config_path.parent,
@@ -87,7 +94,6 @@ def load_config(start: Path | None = None) -> Config:
         ),
         runtime=RuntimeConfig(
             auto_gpu_detect=runtime_raw.get("auto_gpu_detect", True),
-            quota_warning_hours=runtime_raw.get("quota_warning_hours", 5),
         ),
         datasets=raw.get("datasets") or {},
     )

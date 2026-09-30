@@ -17,22 +17,29 @@ def main():
 @main.command()
 @click.argument("script", type=click.Path(exists=True))
 @click.option("--cpu", is_flag=True, help="Run on Kaggle CPU (doesn't use GPU quota)")
+@click.option("--internet/--no-internet", default=None, help="Override Kaggle internet for this run")
+@click.option("--dry-run", is_flag=True, help="Show kernel settings and datasets without pushing")
 @click.option("--detach", is_flag=True, help="Push and return immediately - use `logs`/`pull` later")
-def run(script, cpu, detach):
+def run(script, cpu, internet, dry_run, detach):
     """Run a .py or .ipynb on Kaggle and pull the results back.
 
-    Looks for remote-gpu-settings.yaml in the script's directory and
-    parent directories. local_input and local_output paths are relative
-    to the script's directory.
+    Looks for remote-gpu-settings.yaml or settings.yaml in the script's
+    directory and parent directories. The nearer directory wins; in the
+    same directory, remote-gpu-settings.yaml takes priority. local_input
+    and local_output paths are relative to the script's directory.
     """
     from .kaggle_manager import KaggleRunner
 
     config = load_config(Path(script).parent)
     if cpu:
         config.kaggle.gpu_enabled = False
+    if internet is not None:
+        config.kaggle.internet_enabled = internet
 
     runner = KaggleRunner(config)
-    if detach:
+    if dry_run:
+        runner.preview(Path(script))
+    elif detach:
         runner.launch(Path(script))
     else:
         runner.run(Path(script))
@@ -43,7 +50,7 @@ def run(script, cpu, detach):
 @click.option("--follow", is_flag=True, help="Keep streaming until the run finishes")
 @click.option("--save", type=click.Path(), help="Also append output to this file")
 def logs(show_all, follow, save):
-    """Show the latest kernel's log."""
+    """Show available kernel logs (Kaggle may not expose live cell output)."""
     from .kaggle_manager import KaggleRunner
 
     KaggleRunner(load_config()).stream_logs(show_all, follow, save)
@@ -67,7 +74,7 @@ def status():
             click.echo(f"authenticated: {user}")
             break
     else:
-        click.echo("not authenticated — run `remote-gpu setup`")
+        click.echo("not authenticated - run `remote-gpu setup`")
     click.echo("quota tracking: TODO")
 
 
