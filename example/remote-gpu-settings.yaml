@@ -4,5 +4,6 @@ name: mnist-remote-gpu
 kaggle:
   gpu_enabled: true
 
-runtime:
-  quota_warning_hours: 5
+datasets:
+  iris: uciml/iris
+

@@ -43,6 +43,7 @@ class Config:
     paths: Paths = field(default_factory=Paths)
     kaggle: KaggleConfig = field(default_factory=KaggleConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    datasets: dict = field(default_factory=dict)  # local dir name -> owner/slug
 
 
 def find_config(start: Path | None = None) -> Path:
@@ -86,4 +87,5 @@ def load_config(start: Path | None = None) -> Config:
             auto_gpu_detect=runtime_raw.get("auto_gpu_detect", True),
             quota_warning_hours=runtime_raw.get("quota_warning_hours", 5),
         ),
+        datasets=raw.get("datasets") or {},
     )

@@ -23,6 +23,10 @@ def _relpath(p: str) -> str:
 def build_preamble(config: Config) -> str:
     """Generate the injected cell. No-ops everywhere except on Kaggle."""
     local_input = _relpath(config.paths.local_input)
+    # managed dataset (synced input/) + any user-attached datasets —
+    # values are dataset slugs we glob for under /kaggle/input/**/
+    mounts = {local_input: config.kaggle.dataset_name}
+    mounts.update({name: slug.split("/")[-1] for name, slug in config.datasets.items()})
     lines = [
         PREAMBLE_MARKER,
         "import os, glob",
@@ -30,7 +34,7 @@ def build_preamble(config: Config) -> str:
         # Kaggle mounts datasets under /kaggle/input/datasets/<owner>/<slug>/
         # when attached via API, or /kaggle/input/<slug>/ via the web editor —
         # resolve by globbing instead of hardcoding a convention.
-        f'    _mounts = {{"{local_input}": "{config.kaggle.dataset_name}"}}',
+        f"    _mounts = {mounts!r}",
         "    for _rel, _slug in _mounts.items():",
         "        if not os.path.exists(_rel):",
         '            _hits = glob.glob(f"/kaggle/input/**/{_slug}", recursive=True)',
@@ -39,6 +43,7 @@ def build_preamble(config: Config) -> str:
         "                if _parent:",
         "                    os.makedirs(_parent, exist_ok=True)",
         "                os.symlink(_hits[0], _rel)",
+        '                print(f"[remote-gpu] {_rel} -> {_hits[0]}")',
         "            else:",
         '                print(f"[remote-gpu] WARNING: dataset {_slug} not mounted")',
         '    print("[remote-gpu] /kaggle/input:", os.listdir("/kaggle/input") if os.path.exists("/kaggle/input") else "MISSING")',

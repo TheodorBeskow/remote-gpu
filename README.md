@@ -43,6 +43,19 @@ paths:                    # all optional, these are the defaults
   local_output: "./output"
 kaggle:
   gpu_enabled: true
+
+datasets:                      # attach existing Kaggle datasets (optional)
+  iris: uciml/iris             # ./iris/ resolves to the mounted dataset
+```
+
+## Commands
+
+```bash
+remote-gpu run x.ipynb --detach   # push and return; kernel runs async
+remote-gpu logs                   # tail of latest run's log
+remote-gpu logs --follow          # stream until done
+remote-gpu logs --save run.log    # also write to file
+remote-gpu pull                   # download output after detach
 ```
 
 ## How it works

@@ -60,6 +60,7 @@ class KaggleRunner:
         self.user = _username(config)
         self.dataset_slug = f"{self.user}/{config.kaggle.dataset_name}"
         self.kernel_slug = f"{self.user}/{config.kaggle.notebook_name}"
+        self._managed_exists = False
 
     def run(self, entry: Path) -> None:
         self.launch(entry)
@@ -97,6 +98,7 @@ class KaggleRunner:
         """Upload input/ as (or version onto) our single dataset."""
         input_dir = entry.parent / _relpath(self.config.paths.local_input)
         if not input_dir.is_dir():
+            self._managed_exists = self._dataset_exists()
             click.echo("no input dir — skipping dataset upload")
             return
 
@@ -105,6 +107,7 @@ class KaggleRunner:
         exists = self._dataset_exists()
 
         if digest == state.get("dataset_hash") and exists:
+            self._managed_exists = True
             click.echo("input unchanged — skipping dataset upload")
             return
 
@@ -136,6 +139,7 @@ class KaggleRunner:
 
         state["dataset_hash"] = digest
         self._save_state(state)
+        self._managed_exists = True
 
     def _wait_dataset_ready(self) -> None:
         for _ in range(40):
@@ -170,7 +174,10 @@ class KaggleRunner:
                 "is_private": True,
                 "enable_gpu": self.config.kaggle.gpu_enabled,
                 "enable_internet": False,
-                "dataset_sources": [self.dataset_slug],
+                "dataset_sources": [
+                    *self.config.datasets.values(),
+                    *([self.dataset_slug] if self._managed_exists else []),
+                ],
             }
             (tmp / "kernel-metadata.json").write_text(
                 json.dumps(meta), encoding="utf-8"
