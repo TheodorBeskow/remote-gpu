@@ -1,6 +1,7 @@
 """CLI for remote-gpu."""
 
 import json
+import shutil
 from pathlib import Path
 
 import click
@@ -46,8 +47,8 @@ def run(script, cpu, internet, dry_run, detach):
 
 
 @main.command()
-@click.option("--all", "show_all", is_flag=True, help="Full log instead of last 100 entries")
-@click.option("--follow", is_flag=True, help="Keep streaming until the run finishes")
+@click.option("--all", "show_all", is_flag=True, help="Full log instead of last 100 entries (polling mode)")
+@click.option("--follow", is_flag=True, help="Use Kaggle's live stream when available; otherwise poll until done")
 @click.option("--save", type=click.Path(), help="Also append output to this file")
 def logs(show_all, follow, save):
     """Show available kernel logs (Kaggle may not expose live cell output)."""
@@ -65,17 +66,42 @@ def pull():
 
 
 @main.command()
+@click.option("--yes", is_flag=True, help="Delete download staging without asking")
+def clean(yes):
+    """Delete retained Kaggle output downloads under .remote-gpu/downloads."""
+    downloads = load_config().project_dir / ".remote-gpu" / "downloads"
+    if not downloads.exists():
+        click.echo("no retained downloads")
+        return
+    if not yes:
+        click.confirm(f"Delete all retained downloads under {downloads}?", abort=True)
+    shutil.rmtree(downloads)
+    click.echo(f"removed {downloads}")
+
+
+@main.command()
 def status():
-    """Show Kaggle authentication status (quota tracking is not available yet)."""
-    for name in ("kaggle.json", "credentials.json"):
-        creds = Path.home() / ".kaggle" / name
-        if creds.is_file():
-            user = json.loads(creds.read_text()).get("username", "?")
-            click.echo(f"authenticated: {user}")
-            break
-    else:
-        click.echo("not authenticated - run `remote-gpu setup`")
-    click.echo("quota tracking: TODO")
+    """Verify local Kaggle credentials and API access."""
+    import os
+
+    from .kaggle_manager import _kaggle
+
+    user = os.environ.get("KAGGLE_USERNAME")
+    if not user:
+        for name in ("kaggle.json", "credentials.json"):
+            creds = Path.home() / ".kaggle" / name
+            if creds.is_file():
+                user = json.loads(creds.read_text(encoding="utf-8")).get("username", "?")
+                break
+
+    res = _kaggle("datasets", "list", "--mine", "-p", "1", "--format", "csv")
+    if res.returncode != 0:
+        detail = res.stderr.strip() or res.stdout.strip() or "no details provided"
+        source = f"credentials for {user}" if user else "no local credentials found"
+        raise click.ClickException(f"Kaggle API check failed ({source}): {detail}")
+    click.echo(f"authenticated: {user}" if user else "authenticated")
+    click.echo("Kaggle API access: ok")
+    click.echo("quota tracking: not implemented")
 
 
 @main.command()
