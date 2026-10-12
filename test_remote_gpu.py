@@ -17,8 +17,27 @@ from click.testing import CliRunner
 
 from remote_gpu.cli import main
 from remote_gpu.config import Config, KaggleConfig, Paths, find_config, load_config
-from remote_gpu.kaggle_manager import KaggleRunner, _kaggle, _terminal_status
-from remote_gpu.kaggleify import build_preamble, kaggleify_notebook
+from remote_gpu.kaggle_manager import (
+    KaggleRunner, _hash_file, _kaggle, _notebook_source_hash, _terminal_status,
+)
+from remote_gpu.kaggleify import PREAMBLE_MARKER, build_preamble, kaggleify_notebook
+
+
+def _code_cell(source, outputs=None, cell_id=None):
+    cell = {
+        "cell_type": "code",
+        "metadata": {},
+        "source": [source],
+        "execution_count": None,
+        "outputs": outputs or [],
+    }
+    if cell_id:
+        cell["id"] = cell_id
+    return cell
+
+
+def _notebook(*cells):
+    return {"cells": list(cells), "metadata": {}, "nbformat": 4, "nbformat_minor": 5}
 
 
 class RemoteGpuTests(unittest.TestCase):
@@ -90,6 +109,18 @@ class RemoteGpuTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 0, result.output)
             self.assertFalse(downloads.exists())
             self.assertTrue(state.exists())
+
+    def test_pull_notebook_cli_passes_output_and_force(self):
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            Path("settings.yaml").write_text("kaggle:\n  user: tester\n", encoding="utf-8")
+            with mock.patch.object(KaggleRunner, "pull_notebook", autospec=True) as pull:
+                result = runner.invoke(
+                    main, ["pull-notebook", "--output", "remote.ipynb", "--force"]
+                )
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertEqual(pull.call_args.args[1], Path("remote.ipynb"))
+            self.assertTrue(pull.call_args.args[2])
 
     def test_settings_yaml_alias_and_precedence(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
@@ -220,6 +251,18 @@ class RemoteGpuTests(unittest.TestCase):
                 self.assertFalse(metadata["enable_internet"])
                 self.assertEqual(metadata["code_file"], "solve.py")
                 self.assertEqual(metadata["dataset_sources"], ["uciml/iris"])
+                self.assertEqual(
+                    metadata["mount_candidates"]["iris"],
+                    {
+                        "dataset": "uciml/iris",
+                        "paths": [
+                            "/kaggle/input/datasets/uciml/iris",
+                            "/kaggle/input/uciml/iris",
+                            "/kaggle/input/iris",
+                        ],
+                    },
+                )
+                self.assertNotIn("input", metadata["mount_candidates"])
                 self.assertFalse((root / ".remote-gpu").exists())
 
                 (root / "input").mkdir()
@@ -227,7 +270,16 @@ class RemoteGpuTests(unittest.TestCase):
                 self.assertEqual(preview.exit_code, 0, preview.output)
                 metadata = json.loads(preview.output)
                 self.assertTrue(metadata["enable_internet"])
-                self.assertEqual(metadata["dataset_sources"], ["uciml/iris", f"tester/remote-gpu-{root.name}-data"])
+                managed = f"tester/remote-gpu-{root.name}-data"
+                self.assertEqual(metadata["dataset_sources"], ["uciml/iris", managed])
+                self.assertEqual(
+                    metadata["mount_candidates"]["input"]["paths"],
+                    [
+                        f"/kaggle/input/datasets/{managed}",
+                        f"/kaggle/input/{managed}",
+                        "/kaggle/input/remote-gpu-{0}-data".format(root.name),
+                    ],
+                )
                 self.assertFalse((root / ".remote-gpu").exists())
 
     def test_kaggle_output_subprocess_handles_unicode_on_windows(self):
@@ -384,6 +436,117 @@ class RemoteGpuTests(unittest.TestCase):
             ):
                 self.assertFalse(runner._fetch_output(root))
 
+    def test_pull_notebook_updates_unchanged_notebook_without_preamble(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory)
+            entry = root / "solve.ipynb"
+            original = _notebook(
+                _code_cell("print('hello')", cell_id="local-cell"),
+                {"cell_type": "markdown", "metadata": {}, "source": ["notes"]},
+            )
+            entry.write_text(json.dumps(original), encoding="utf-8")
+            runner = KaggleRunner(Config(project_dir=root, name="run", kaggle=KaggleConfig(user="tester")))
+            runner._save_state({
+                "last_kernel": runner.kernel_slug,
+                "entry_path": str(entry),
+                "entry_hash": _hash_file(entry),
+                "entry_source_hash": _notebook_source_hash(original),
+            })
+            remote = _notebook(
+                _code_cell(f"{PREAMBLE_MARKER}\nsetup", cell_id="remote-gpu-setup"),
+                _code_cell(
+                    "print('hello')",
+                    cell_id="remote-cell",
+                    outputs=[{"output_type": "stream", "name": "stdout", "text": ["hello\n"]}],
+                ),
+                {"cell_type": "markdown", "metadata": {}, "source": ["notes"]},
+            )
+            remote["cells"][1]["execution_count"] = 1
+
+            def pull(*args):
+                self.assertEqual(args[:2], ("kernels", "pull"))
+                download = Path(args[args.index("-p") + 1])
+                (download / "remote.ipynb").write_text(json.dumps(remote), encoding="utf-8")
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with mock.patch("remote_gpu.kaggle_manager._kaggle", side_effect=pull) as kaggle:
+                runner.pull_notebook()
+            self.assertEqual(kaggle.call_count, 1)
+            pulled = json.loads(entry.read_text(encoding="utf-8"))
+            self.assertNotIn(PREAMBLE_MARKER, entry.read_text(encoding="utf-8"))
+            self.assertEqual(pulled["cells"][0]["outputs"][0]["text"], ["hello\n"])
+            self.assertEqual(pulled["cells"][0]["execution_count"], 1)
+
+    def test_pull_notebook_uses_sidecar_for_local_or_remote_mismatch(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory)
+            entry = root / "solve.ipynb"
+            pushed = _notebook(_code_cell("print('old')"))
+            entry.write_text(json.dumps(pushed), encoding="utf-8")
+            runner = KaggleRunner(Config(project_dir=root, name="run", kaggle=KaggleConfig(user="tester")))
+            state = {
+                "last_kernel": runner.kernel_slug,
+                "entry_path": str(entry),
+                "entry_hash": _hash_file(entry),
+                "entry_source_hash": _notebook_source_hash(pushed),
+            }
+            remote = _notebook(
+                _code_cell(f"{PREAMBLE_MARKER}\nsetup", cell_id="remote-gpu-setup"),
+                _code_cell("print('old')", outputs=[{"output_type": "stream", "text": ["old\n"]}]),
+            )
+
+            def pull(*args):
+                download = Path(args[args.index("-p") + 1])
+                (download / "remote.ipynb").write_text(json.dumps(remote), encoding="utf-8")
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            entry.write_text(json.dumps(_notebook(_code_cell("print('new')"))), encoding="utf-8")
+            runner._save_state(state)
+            notice = io.StringIO()
+            with mock.patch("remote_gpu.kaggle_manager._kaggle", side_effect=pull), redirect_stderr(notice):
+                runner.pull_notebook()
+            sidecar = root / "solve.remote-gpu.ipynb"
+            self.assertTrue(sidecar.exists())
+            self.assertIn("changed since launch", notice.getvalue())
+            self.assertIn("print('new')", entry.read_text(encoding="utf-8"))
+            self.assertNotIn(PREAMBLE_MARKER, sidecar.read_text(encoding="utf-8"))
+            sidecar.unlink()
+
+            remote["cells"][1]["source"] = ["print('different')"]
+            entry.write_text(json.dumps(pushed), encoding="utf-8")
+            runner._save_state(state)
+            notice = io.StringIO()
+            with mock.patch("remote_gpu.kaggle_manager._kaggle", side_effect=pull), redirect_stderr(notice):
+                runner.pull_notebook()
+            self.assertTrue(sidecar.exists())
+            self.assertIn("different version", notice.getvalue())
+            self.assertIn("print('old')", entry.read_text(encoding="utf-8"))
+
+    def test_pull_notebook_output_requires_force_for_existing_file(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory)
+            runner = KaggleRunner(Config(project_dir=root, name="run", kaggle=KaggleConfig(user="tester")))
+            runner._save_state({})
+            output = root / "remote.ipynb"
+            output.write_text("existing", encoding="utf-8")
+            remote = _notebook(
+                _code_cell(f"{PREAMBLE_MARKER}\nsetup"),
+                _code_cell("print('done')"),
+            )
+
+            def pull(*args):
+                download = Path(args[args.index("-p") + 1])
+                (download / "remote.ipynb").write_text(json.dumps(remote), encoding="utf-8")
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with mock.patch("remote_gpu.kaggle_manager._kaggle", side_effect=pull):
+                with self.assertRaisesRegex(click.UsageError, "--force"):
+                    runner.pull_notebook(output)
+                runner.pull_notebook(output, force=True)
+            pulled = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(len(pulled["cells"]), 1)
+            self.assertEqual(pulled["cells"][0]["source"], ["print('done')"])
+
     def test_run_explains_missing_live_logs_once(self):
         runner = KaggleRunner(Config(project_dir=Path.cwd(), name="run", kaggle=KaggleConfig(user="tester")))
         statuses = iter(("status: running", "status: running", "status: complete"))
@@ -437,6 +600,31 @@ class RemoteGpuTests(unittest.TestCase):
             self.assertEqual(popen.call_args.kwargs["env"]["PYTHONIOENCODING"], "utf-8")
             self.assertEqual(output.getvalue(), "step 1\rstep 2\n")
             self.assertEqual((root / "run.log").read_bytes().decode("utf-8"), output.getvalue())
+
+    def test_logs_follow_replaces_unicode_unsupported_by_windows_console(self):
+        runner = KaggleRunner(Config(project_dir=Path.cwd(), name="run", kaggle=KaggleConfig(user="tester")))
+        process = mock.Mock(stdout=io.BytesIO("done ✓\n".encode("utf-8")))
+        process.wait.return_value = 0
+        process.poll.return_value = 0
+
+        class WindowsStdout:
+            encoding = "cp1252"
+            chunks = []
+
+            def write(self, text):
+                self.chunks.append(text.encode(self.encoding).decode(self.encoding))
+
+            def flush(self):
+                pass
+
+        console = WindowsStdout()
+        with mock.patch("remote_gpu.kaggle_manager._kaggle", return_value=mock.Mock(
+            returncode=0, stdout="-f, --follow"
+        )), mock.patch("remote_gpu.kaggle_manager.subprocess.Popen", return_value=process), mock.patch(
+            "remote_gpu.kaggle_manager.sys.stdout", console
+        ):
+            runner.stream_logs(show_all=False, follow=True, save=None)
+        self.assertEqual("".join(console.chunks), "done ?\n")
 
     def test_logs_follow_does_not_stop_kernel_on_interrupt(self):
         runner = KaggleRunner(Config(project_dir=Path.cwd(), name="run", kaggle=KaggleConfig(user="tester")))
@@ -843,12 +1031,19 @@ class RemoteGpuTests(unittest.TestCase):
     def test_new_launch_uses_new_download_stage(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
             root = Path(directory)
+            entry = root / "solve.ipynb"
+            notebook = _notebook(_code_cell("print('run')"))
+            entry.write_text(json.dumps(notebook), encoding="utf-8")
             runner = KaggleRunner(Config(project_dir=root, name="run", kaggle=KaggleConfig(user="tester")))
             with mock.patch.object(runner, "_sync_dataset"), mock.patch.object(runner, "_push_kernel"):
-                runner.launch(root / "solve.py")
+                runner.launch(entry)
+                state = runner._load_state()
+                self.assertEqual(state["entry_path"], str(entry.resolve()))
+                self.assertEqual(state["entry_hash"], _hash_file(entry))
+                self.assertEqual(state["entry_source_hash"], _notebook_source_hash(notebook))
                 stage = runner._output_stage()
                 (stage / "previous.pt").write_bytes(b"previous")
-                runner.launch(root / "solve.py")
+                runner.launch(entry)
                 self.assertNotEqual(runner._output_stage(), stage)
                 self.assertTrue((stage / "previous.pt").exists())
 

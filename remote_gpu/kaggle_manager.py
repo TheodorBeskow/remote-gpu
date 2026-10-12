@@ -21,7 +21,7 @@ from pathlib import Path, PurePosixPath
 import click
 
 from .config import Config
-from .kaggleify import kaggleify_notebook, kaggleify_script
+from .kaggleify import PREAMBLE_MARKER, kaggleify_notebook, kaggleify_script
 
 POLL_INTERVAL = 15  # seconds between status checks
 MAX_STATUS_FAILURES = 3
@@ -70,6 +70,35 @@ def _hash_dir(directory: Path) -> str:
     return h.hexdigest()
 
 
+def _hash_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _cell_source(cell: dict) -> str:
+    source = cell.get("source", "")
+    return "".join(source) if isinstance(source, list) else str(source)
+
+
+def _notebook_source_hash(notebook: dict) -> str:
+    signature = [
+        [cell.get("cell_type"), _cell_source(cell)]
+        for cell in notebook.get("cells", [])
+        if isinstance(cell, dict)
+    ]
+    encoded = json.dumps(signature, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _strip_preamble_cell(notebook: dict) -> int:
+    cells = notebook.get("cells", [])
+    notebook["cells"] = [
+        cell
+        for cell in cells
+        if not (cell.get("cell_type") == "code" and PREAMBLE_MARKER in _cell_source(cell))
+    ]
+    return len(cells) - len(notebook["cells"])
+
+
 def _terminal_status(output: str) -> str | None:
     match = re.search(
         r"\b(cancel_acknowledged|complete|error|failed|failure|cancelled|canceled|cancel|timeout|timed out|timed_out)\b",
@@ -97,6 +126,14 @@ def _format_bytes(size: int) -> str:
             return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
         value /= 1024
     return f"{value:.1f} TB"
+
+
+def _write_stdout(text: str) -> None:
+    try:
+        sys.stdout.write(text)
+    except UnicodeEncodeError:
+        encoding = sys.stdout.encoding or "utf-8"
+        sys.stdout.write(text.encode(encoding, errors="replace").decode(encoding, errors="replace"))
 
 
 class KaggleRunner:
@@ -131,6 +168,21 @@ class KaggleRunner:
         state = self._load_state()
         state["last_kernel"] = self.kernel_slug
         state["entry_dir"] = str(entry.parent.resolve())
+        state["entry_path"] = str(entry.resolve())
+        if entry.is_file():
+            state["entry_hash"] = _hash_file(entry)
+            if entry.suffix == ".ipynb":
+                try:
+                    state["entry_source_hash"] = _notebook_source_hash(
+                        json.loads(entry.read_text(encoding="utf-8"))
+                    )
+                except (OSError, json.JSONDecodeError):
+                    state.pop("entry_source_hash", None)
+            else:
+                state.pop("entry_source_hash", None)
+        else:
+            state.pop("entry_hash", None)
+            state.pop("entry_source_hash", None)
         state["download_run_id"] = uuid.uuid4().hex
         state["download_kernel"] = self.kernel_slug
         self._save_state(state)
@@ -218,7 +270,27 @@ class KaggleRunner:
     def preview(self, entry: Path) -> None:
         """Print planned kernel metadata without syncing or pushing."""
         managed_input = (entry.parent / _relpath(self.config.paths.local_input)).is_dir()
-        click.echo(json.dumps(self._kernel_metadata(entry, managed_input), indent=2))
+        metadata = self._kernel_metadata(entry, managed_input)
+        metadata["mount_candidates"] = self._mount_candidates(managed_input)
+        click.echo(json.dumps(metadata, indent=2))
+
+    def _mount_candidates(self, managed_input: bool) -> dict:
+        root = PurePosixPath(self.config.paths.kaggle_input)
+        mounts = {_relpath(self.config.paths.local_input): self.dataset_slug} if managed_input else {}
+        mounts.update(self.config.datasets)
+        result = {}
+        for local_path, source in mounts.items():
+            slug = source.rsplit("/", 1)[-1]
+            owner = source.split("/", 1)[0] if "/" in source else None
+            candidates = []
+            if owner:
+                candidates.extend((
+                    (root / "datasets" / owner / slug).as_posix(),
+                    (root / owner / slug).as_posix(),
+                ))
+            candidates.append((root / slug).as_posix())
+            result[local_path] = {"dataset": source, "paths": candidates}
+        return result
 
     def _kernel_metadata(self, entry: Path, managed_input: bool) -> dict:
         if not PurePosixPath(self.config.paths.kaggle_output).is_relative_to(
@@ -334,7 +406,7 @@ class KaggleRunner:
     def _print_new_logs(self, seen: int) -> int:
         entries = self._fetch_log_entries()
         for e in entries[seen:]:
-            sys.stdout.write(e.get("data", ""))
+            _write_stdout(e.get("data", ""))
         sys.stdout.flush()
         return len(entries)
 
@@ -367,7 +439,7 @@ class KaggleRunner:
                     start = seen
                 for e in entries[start:]:
                     data = e.get("data", "")
-                    sys.stdout.write(data)
+                    _write_stdout(data)
                     if fh:
                         fh.write(data)
                 sys.stdout.flush()
@@ -398,7 +470,7 @@ class KaggleRunner:
             try:
                 while chunk := stream.read(1):
                     received = True
-                    sys.stdout.write(chunk)
+                    _write_stdout(chunk)
                     if fh:
                         fh.write(chunk)
                     if chunk in "\r\n":
@@ -438,6 +510,99 @@ class KaggleRunner:
             click.echo(f"kernel {status}; downloaded available output")
             if status == "cancel_acknowledged":
                 click.echo(STALE_OUTPUT_NOTICE, err=True)
+
+    def pull_notebook(self, output: Path | None = None, force: bool = False) -> None:
+        """Pull the latest Kaggle notebook without the injected setup cell."""
+        state = self._load_state()
+        recorded = state.get("entry_path")
+        entry = Path(recorded).expanduser() if recorded else None
+        if entry and not entry.is_absolute():
+            entry = self.config.project_dir / entry
+        if entry and entry.suffix != ".ipynb":
+            raise click.UsageError("pull-notebook is only available for .ipynb runs")
+        if output and output.suffix != ".ipynb":
+            raise click.UsageError("--output must be an .ipynb file")
+        if not entry and not output:
+            raise click.UsageError(
+                "no notebook launch was recorded; pass --output to choose where to save it"
+            )
+
+        notebook = self._pull_notebook_source()
+        removed = _strip_preamble_cell(notebook)
+        if not removed:
+            click.echo("warning: pulled notebook did not contain the remote-gpu setup cell", err=True)
+
+        remote_hash = _notebook_source_hash(notebook)
+        source_matches = remote_hash == state.get("entry_source_hash")
+        local_unchanged = bool(
+            entry and entry.is_file() and state.get("entry_hash") == _hash_file(entry)
+        )
+        if not source_matches:
+            click.echo(
+                "warning: pulled notebook source does not match the recorded launch source; "
+                "Kaggle may have returned a different version",
+                err=True,
+            )
+
+        if output:
+            target = output.expanduser()
+            if not target.is_absolute():
+                target = Path.cwd() / target
+            if target.exists():
+                same_as_entry = entry is not None and target.resolve() == entry.resolve()
+                allowed_update = same_as_entry and local_unchanged and source_matches
+                if not force and not allowed_update:
+                    raise click.UsageError(
+                        f"{target} already exists or has changed since launch; use --force to overwrite"
+                    )
+        elif local_unchanged and source_matches:
+            target = entry
+        else:
+            if not entry or not entry.is_file():
+                reason = "the launched notebook is missing locally"
+            elif not state.get("entry_hash"):
+                reason = "the launched notebook cannot be verified locally"
+            elif not local_unchanged:
+                reason = "local notebook changed since launch"
+            else:
+                reason = "pulled notebook source differs from launch"
+            target = entry.with_name(f"{entry.stem}.remote-gpu{entry.suffix}")
+            click.echo(f"{reason}; saving pulled notebook as {target}", err=True)
+            if target.exists() and not force:
+                raise click.UsageError(f"{target} already exists; use --force to overwrite")
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temp_name = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=target.parent, delete=False
+            ) as tmp:
+                json.dump(notebook, tmp, ensure_ascii=True, indent=1)
+                tmp.write("\n")
+                temp_name = tmp.name
+            os.replace(temp_name, target)
+        except Exception:
+            if temp_name:
+                Path(temp_name).unlink(missing_ok=True)
+            raise
+        click.echo(f"notebook -> {target}")
+
+    def _pull_notebook_source(self) -> dict:
+        with self._temp_dir() as tmp:
+            tmp = Path(tmp)
+            res = _kaggle("kernels", "pull", self.kernel_slug, "-p", str(tmp))
+            if res.returncode != 0:
+                detail = res.stderr.strip() or res.stdout.strip() or "no details provided"
+                raise click.ClickException(f"Kaggle notebook pull failed: {detail}")
+            candidates = list(tmp.rglob("*.ipynb"))
+            if len(candidates) != 1:
+                raise click.ClickException(
+                    f"expected one notebook from Kaggle pull, found {len(candidates)}"
+                )
+            try:
+                return json.loads(candidates[0].read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise click.ClickException("Kaggle returned an invalid notebook") from exc
 
     def _output_stage(self) -> Path:
         state = self._load_state()

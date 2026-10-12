@@ -2,6 +2,7 @@
 
 import json
 import shutil
+import sys
 from pathlib import Path
 
 import click
@@ -12,7 +13,11 @@ from .config import load_config
 @click.group()
 def main():
     """Run Python on Kaggle GPUs from your local machine."""
-    pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, TypeError, ValueError):
+            pass
 
 
 @main.command()
@@ -63,6 +68,16 @@ def pull():
     from .kaggle_manager import KaggleRunner
 
     KaggleRunner(load_config()).pull()
+
+
+@main.command("pull-notebook")
+@click.option("--output", type=click.Path(dir_okay=False, path_type=Path), help="Write the notebook to this .ipynb path")
+@click.option("--force", is_flag=True, help="Overwrite the selected output file")
+def pull_notebook(output, force):
+    """Pull the Kaggle notebook without the injected setup cell."""
+    from .kaggle_manager import KaggleRunner
+
+    KaggleRunner(load_config()).pull_notebook(output, force)
 
 
 @main.command()

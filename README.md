@@ -66,10 +66,13 @@ remote-gpu logs                   # tail of latest run's log
 remote-gpu logs --follow          # stream until done
 remote-gpu logs --save run.log    # also write to file
 remote-gpu pull                   # download available output after a run stops
+remote-gpu pull-notebook          # pull the Kaggle notebook without the setup cell
 remote-gpu clean                  # delete retained .remote-gpu/downloads staging
 ```
 
-`remote-gpu status` verifies credentials with a Kaggle API call instead of only checking that a credentials file exists; quota tracking is not implemented. `--internet` and `--no-internet` override the YAML value for one run; without either flag, the YAML setting is used. `--dry-run` prints the planned kernel metadata, including GPU, internet, and dataset sources, without uploading data, contacting Kaggle, or saving run state. A local input directory is shown as a planned managed dataset; dry-run does not verify whether it has already been uploaded. A Kaggle username must still be configured so the preview can show the kernel and dataset IDs.
+`remote-gpu status` verifies credentials with a Kaggle API call instead of only checking that a credentials file exists; quota tracking is not implemented. `--internet` and `--no-internet` override the YAML value for one run; without either flag, the YAML setting is used. `--dry-run` prints the planned kernel metadata, including GPU, internet, dataset sources, and `mount_candidates` listing the dataset mount paths remote-gpu will check, without uploading data, contacting Kaggle, or saving run state. A local input directory is shown as a planned managed dataset; dry-run does not verify whether it has already been uploaded or which mount candidate Kaggle will use. A Kaggle username must still be configured so the preview can show the kernel and dataset IDs.
+
+`remote-gpu pull-notebook` uses `kaggle kernels pull` for notebook runs and removes the injected remote-gpu setup cell. If the local notebook is unchanged since launch and the pulled source matches it, the command updates it in place, including any outputs Kaggle saved in the notebook. If the local file changed, the launch record is unavailable, or the pulled source does not match, it writes `<name>.remote-gpu.ipynb` instead of overwriting your edits. Use `--output path.ipynb` to choose a destination and `--force` to overwrite an existing destination.
 
 A failed, cancelled (including Kaggle's `CANCEL_ACKNOWLEDGED` status), or timed-out kernel can still have downloadable output. `remote-gpu run` attempts to recover it before reporting the failure; `remote-gpu pull` also attempts a download after those statuses. Recovery depends on what Kaggle makes available, and an unavailable or empty output is reported as an error. Kaggle may return files from an earlier completed version after cancellation; check that downloaded files belong to the run you intended before treating them as recovered partial results.
 
